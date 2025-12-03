@@ -256,6 +256,44 @@ app.post('/api/webhook/testmail', async (req, res) => {
   }
 });
 
+// ============== CLOUDFLARE EMAIL WEBHOOK ==============
+// This endpoint receives incoming emails from Cloudflare Email Workers
+app.post('/api/webhook/email', async (req, res) => {
+  try {
+    console.log('📧 Received email from Cloudflare:', JSON.stringify(req.body, null, 2));
+    
+    const { to, from, subject, text, html } = req.body;
+    
+    // Extract the email address from 'to' field
+    const toEmail = Array.isArray(to) ? to[0] : to;
+    
+    // Check if mailbox exists
+    const mailbox = await Mailbox.findOne({ email: toEmail, is_active: true });
+    
+    if (!mailbox) {
+      console.log('Mailbox not found for:', toEmail);
+      return res.status(200).json({ received: true, stored: false });
+    }
+    
+    // Store the email
+    const email = new Email({
+      mailbox_email: toEmail,
+      sender: from || 'unknown@sender.com',
+      subject: subject || '(No Subject)',
+      body: text || '',
+      body_html: html || ''
+    });
+    
+    await email.save();
+    console.log('✅ Email stored successfully for:', toEmail);
+    
+    res.json({ received: true, stored: true });
+  } catch (error) {
+    console.error('Cloudflare webhook error:', error);
+    res.status(500).json({ error: 'Webhook processing failed' });
+  }
+});
+
 // ============== CLEANUP CRON JOB ==============
 // Run every minute to clean up expired mailboxes
 cron.schedule('* * * * *', async () => {

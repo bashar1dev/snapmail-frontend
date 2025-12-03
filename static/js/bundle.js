@@ -47791,7 +47791,7 @@ var _jsxFileName = "/app/frontend/src/App.js",
 
 
 
-const BACKEND_URL = "http://localhost:3001";
+const BACKEND_URL = "https://starfish-app-e9kns.ondigitalocean.app";
 const API = `${BACKEND_URL}/api`;
 const formatTimeRemaining = seconds => {
   const mins = Math.floor(seconds / 60);
