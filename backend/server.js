@@ -4,13 +4,86 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const cron = require('node-cron');
 const { v4: uuidv4 } = require('uuid');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const compression = require('compression');
+const { body, param, validationResult } = require('express-validator');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// ============== SECURITY MIDDLEWARE ==============
+
+// Security headers
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
+
+// Gzip compression
+app.use(compression());
+
+// CORS - restrict to allowed origins
+const allowedOrigins = [
+  'https://snapmail.pages.dev',
+  'http://localhost:3000',
+  'http://localhost:5173'
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Not allowed by CORS'), false);
+  },
+  credentials: true
+}));
+
+app.use(express.json({ limit: '1mb' }));
+
+// Rate limiting - general API
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // 100 requests per window
+  message: { error: 'Too many requests, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+// Rate limiting - mailbox creation (stricter)
+const createMailboxLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 10, // 10 mailboxes per hour per IP
+  message: { error: 'Too many mailboxes created. Please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+// Apply general rate limiter to all API routes
+app.use('/api/', generalLimiter);
+
+// ============== VALIDATION HELPERS ==============
+const handleValidationErrors = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: 'Invalid input', details: errors.array() });
+  }
+  next();
+};
+
+// Sanitize string input
+const sanitizeString = (str) => {
+  if (!str) return '';
+  return str.toString().trim().slice(0, 10000); // Limit length
+};
+
+// Sanitize email address
+const sanitizeEmail = (email) => {
+  if (!email) return '';
+  return email.toString().toLowerCase().trim().slice(0, 255);
+};
 
 // MongoDB Connection
 mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/snapmail')
@@ -21,11 +94,15 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/snapmail'
 
 // Mailbox Schema
 const mailboxSchema = new mongoose.Schema({
-  email: { type: String, required: true, unique: true },
-  created_at: { type: Date, default: Date.now },
-  expires_at: { type: Date, required: true },
-  is_active: { type: Boolean, default: true }
+  email: { type: String, required: true, unique: true, index: true },
+  created_at: { type: Date, default: Date.now, index: true },
+  expires_at: { type: Date, required: true, index: true },
+  is_active: { type: Boolean, default: true, index: true }
 });
+
+// Compound index for faster queries
+mailboxSchema.index({ email: 1, is_active: 1 });
+mailboxSchema.index({ expires_at: 1, is_active: 1 });
 
 const Mailbox = mongoose.model('Mailbox', mailboxSchema);
 
@@ -36,9 +113,12 @@ const emailSchema = new mongoose.Schema({
   subject: { type: String, default: '(No Subject)' },
   body: { type: String, default: '' },
   body_html: { type: String, default: '' },
-  received_at: { type: Date, default: Date.now },
+  received_at: { type: Date, default: Date.now, index: true },
   is_read: { type: Boolean, default: false }
 });
+
+// Compound index for email queries
+emailSchema.index({ mailbox_email: 1, received_at: -1 });
 
 const Email = mongoose.model('Email', emailSchema);
 
@@ -66,11 +146,15 @@ function getTimeRemaining(expiresAt) {
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    version: '1.1.0'
+  });
 });
 
-// Create new mailbox
-app.post('/api/mailbox/create', async (req, res) => {
+// Create new mailbox (with stricter rate limit)
+app.post('/api/mailbox/create', createMailboxLimiter, async (req, res) => {
   try {
     const email = generateEmailAddress();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
@@ -264,8 +348,13 @@ app.post('/api/webhook/email', async (req, res) => {
     
     const { to, from, subject, text, html } = req.body;
     
-    // Extract the email address from 'to' field
-    const toEmail = Array.isArray(to) ? to[0] : to;
+    // Extract and sanitize the email address from 'to' field
+    const rawToEmail = Array.isArray(to) ? to[0] : to;
+    const toEmail = sanitizeEmail(rawToEmail);
+    
+    if (!toEmail) {
+      return res.status(400).json({ error: 'Invalid recipient email' });
+    }
     
     // Check if mailbox exists
     const mailbox = await Mailbox.findOne({ email: toEmail, is_active: true });
@@ -275,13 +364,13 @@ app.post('/api/webhook/email', async (req, res) => {
       return res.status(200).json({ received: true, stored: false });
     }
     
-    // Store the email
+    // Store the email with sanitized inputs
     const email = new Email({
       mailbox_email: toEmail,
-      sender: from || 'unknown@sender.com',
-      subject: subject || '(No Subject)',
-      body: text || '',
-      body_html: html || ''
+      sender: sanitizeEmail(from) || 'unknown@sender.com',
+      subject: sanitizeString(subject) || '(No Subject)',
+      body: sanitizeString(text) || '',
+      body_html: sanitizeString(html) || ''
     });
     
     await email.save();
@@ -299,16 +388,37 @@ app.post('/api/webhook/email', async (req, res) => {
 cron.schedule('* * * * *', async () => {
   try {
     const now = new Date();
-    const expired = await Mailbox.find({ expires_at: { $lt: now }, is_active: true });
     
-    for (const mailbox of expired) {
-      await Email.deleteMany({ mailbox_email: mailbox.email });
-      await Mailbox.deleteOne({ _id: mailbox._id });
-      console.log(`🗑️ Cleaned up expired mailbox: ${mailbox.email}`);
-    }
+    // Get expired mailbox emails
+    const expiredMailboxes = await Mailbox.find(
+      { expires_at: { $lt: now }, is_active: true },
+      { email: 1 }
+    ).limit(100); // Process max 100 at a time
+    
+    if (expiredMailboxes.length === 0) return;
+    
+    const expiredEmails = expiredMailboxes.map(m => m.email);
+    
+    // Batch delete emails and mailboxes
+    await Email.deleteMany({ mailbox_email: { $in: expiredEmails } });
+    await Mailbox.deleteMany({ email: { $in: expiredEmails } });
+    
+    console.log(`🗑️ Cleaned up ${expiredMailboxes.length} expired mailboxes`);
   } catch (error) {
     console.error('Cleanup error:', error);
   }
+});
+
+// ============== ERROR HANDLING ==============
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Server error:', err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 // ============== START SERVER ==============
