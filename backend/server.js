@@ -125,13 +125,25 @@ const Email = mongoose.model('Email', emailSchema);
 // ============== HELPER FUNCTIONS ==============
 
 // Generate random email address
-function generateEmailAddress() {
+function generateEmailAddress(customPrefix = null) {
+  const domain = process.env.EMAIL_DOMAIN || 'snapmail.temp';
+  
+  // If custom prefix provided, validate and use it
+  if (customPrefix) {
+    const sanitized = customPrefix.toLowerCase()
+      .replace(/[^a-z0-9._-]/g, '')
+      .slice(0, 20);
+    if (sanitized.length >= 3) {
+      return `${sanitized}@${domain}`;
+    }
+  }
+  
+  // Default: generate random
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
   let localPart = '';
   for (let i = 0; i < 10; i++) {
     localPart += chars.charAt(Math.floor(Math.random() * chars.length));
   }
-  const domain = process.env.EMAIL_DOMAIN || 'snapmail.temp';
   return `${localPart}@${domain}`;
 }
 
@@ -149,15 +161,34 @@ app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
-    version: '1.1.0'
+    version: '1.2.0'
   });
 });
 
 // Create new mailbox (with stricter rate limit)
 app.post('/api/mailbox/create', createMailboxLimiter, async (req, res) => {
   try {
-    const email = generateEmailAddress();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+    const { prefix, duration = 10 } = req.body || {};
+    
+    // Validate duration (10, 30, or 60 minutes)
+    const validDurations = [10, 30, 60];
+    const selectedDuration = validDurations.includes(duration) ? duration : 10;
+    
+    // Check if custom prefix is already taken
+    if (prefix) {
+      const domain = process.env.EMAIL_DOMAIN || 'snapmail.temp';
+      const sanitized = prefix.toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 20);
+      if (sanitized.length >= 3) {
+        const customEmail = `${sanitized}@${domain}`;
+        const existing = await Mailbox.findOne({ email: customEmail, is_active: true });
+        if (existing) {
+          return res.status(409).json({ error: 'This email prefix is already in use. Try another one.' });
+        }
+      }
+    }
+    
+    const email = generateEmailAddress(prefix);
+    const expiresAt = new Date(Date.now() + selectedDuration * 60 * 1000);
     
     const mailbox = new Mailbox({
       email,
@@ -170,13 +201,15 @@ app.post('/api/mailbox/create', createMailboxLimiter, async (req, res) => {
       email: mailbox.email,
       created_at: mailbox.created_at,
       expires_at: mailbox.expires_at,
-      time_remaining_seconds: getTimeRemaining(mailbox.expires_at)
+      time_remaining_seconds: getTimeRemaining(mailbox.expires_at),
+      duration_minutes: selectedDuration
     });
   } catch (error) {
     console.error('Error creating mailbox:', error);
     res.status(500).json({ error: 'Failed to create mailbox' });
   }
 });
+
 
 // Get mailbox info
 app.get('/api/mailbox/:email', async (req, res) => {
