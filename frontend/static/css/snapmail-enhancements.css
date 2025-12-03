@@ -1,0 +1,21 @@
+/* SnapMail Enhancements CSS v7 */
+/* Note: Most styles are now injected via JavaScript for better control */
+/* This file provides fallback styles only */
+
+/* Ensure smooth scrolling */
+html {
+  scroll-behavior: smooth;
+}
+
+/* Prevent layout shift when modal opens */
+body.modal-open {
+  overflow: hidden;
+}
+
+/* Print styles - hide controls when printing */
+@media print {
+  .snapmail-controls,
+  .snapmail-help-modal {
+    display: none !important;
+  }
+}

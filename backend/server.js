@@ -7,7 +7,7 @@ const { v4: uuidv4 } = require('uuid');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
-const { body, param, validationResult } = require('express-validator');
+const { body, param, query, validationResult } = require('express-validator');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -22,12 +22,11 @@ app.use(helmet({
 // Gzip compression
 app.use(compression());
 
-// CORS - restrict to allowed origins
-const allowedOrigins = [
-  'https://snapmail.pages.dev',
-  'http://localhost:3000',
-  'http://localhost:5173'
-];
+// CORS - configurable via env (comma-separated list)
+const defaultOrigins = ['https://snapmail.pages.dev', 'http://localhost:3000', 'http://localhost:5173'];
+const allowedOrigins = process.env.ALLOWED_ORIGINS 
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean)
+  : defaultOrigins;
 
 app.use(cors({
   origin: function (origin, callback) {
@@ -43,7 +42,7 @@ app.use(cors({
 
 app.use(express.json({ limit: '1mb' }));
 
-// Rate limiting - general API
+// Rate limiting - general API (excludes webhooks)
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // 100 requests per window
@@ -61,8 +60,15 @@ const createMailboxLimiter = rateLimit({
   legacyHeaders: false
 });
 
-// Apply general rate limiter to all API routes
-app.use('/api/', generalLimiter);
+// Apply general rate limiter to all API routes EXCEPT webhooks
+// Webhooks need to be unrestricted for email delivery services
+app.use('/api/', (req, res, next) => {
+  // Skip rate limiting for webhook endpoints
+  if (req.path.startsWith('/webhook/')) {
+    return next();
+  }
+  return generalLimiter(req, res, next);
+});
 
 // ============== VALIDATION HELPERS ==============
 const handleValidationErrors = (req, res, next) => {
@@ -73,16 +79,46 @@ const handleValidationErrors = (req, res, next) => {
   next();
 };
 
-// Sanitize string input
-const sanitizeString = (str) => {
+// Size limits for content
+const MAX_SUBJECT_LENGTH = 500;
+const MAX_BODY_LENGTH = 100000; // 100KB
+const MAX_EMAIL_LENGTH = 255;
+
+// Sanitize string input with configurable max length
+const sanitizeString = (str, maxLength = MAX_BODY_LENGTH) => {
   if (!str) return '';
-  return str.toString().trim().slice(0, 10000); // Limit length
+  return str.toString().trim().slice(0, maxLength);
 };
 
 // Sanitize email address
 const sanitizeEmail = (email) => {
   if (!email) return '';
-  return email.toString().toLowerCase().trim().slice(0, 255);
+  return email.toString().toLowerCase().trim().slice(0, MAX_EMAIL_LENGTH);
+};
+
+// Strip potentially dangerous HTML tags (keep basic formatting)
+const sanitizeHtml = (html, maxLength = MAX_BODY_LENGTH) => {
+  if (!html) return '';
+  let sanitized = html.toString().slice(0, maxLength);
+  // Remove script tags and event handlers
+  sanitized = sanitized.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+  sanitized = sanitized.replace(/on\w+\s*=\s*["'][^"']*["']/gi, '');
+  sanitized = sanitized.replace(/on\w+\s*=\s*[^\s>]+/gi, '');
+  // Remove javascript: URLs
+  sanitized = sanitized.replace(/javascript:/gi, '');
+  // Remove data: URLs in src/href (potential XSS)
+  sanitized = sanitized.replace(/(src|href)\s*=\s*["']?\s*data:/gi, '$1="');
+  return sanitized;
+};
+
+// Validate MongoDB ObjectId format
+const isValidObjectId = (id) => {
+  return /^[a-fA-F0-9]{24}$/.test(id);
+};
+
+// Validate email format
+const isValidEmailFormat = (email) => {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 };
 
 // MongoDB Connection
@@ -165,8 +201,15 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Create new mailbox (with stricter rate limit)
-app.post('/api/mailbox/create', createMailboxLimiter, async (req, res) => {
+// Create new mailbox (with stricter rate limit and validation)
+app.post('/api/mailbox/create', 
+  createMailboxLimiter,
+  [
+    body('duration').optional().isInt().isIn([10, 30, 60]).withMessage('Duration must be 10, 30, or 60 minutes'),
+    body('prefix').optional().isString().isLength({ min: 3, max: 20 }).matches(/^[a-zA-Z0-9._-]+$/).withMessage('Prefix must be 3-20 alphanumeric characters')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
   try {
     const { prefix, duration = 10 } = req.body || {};
     
@@ -174,28 +217,53 @@ app.post('/api/mailbox/create', createMailboxLimiter, async (req, res) => {
     const validDurations = [10, 30, 60];
     const selectedDuration = validDurations.includes(duration) ? duration : 10;
     
-    // Check if custom prefix is already taken
-    if (prefix) {
-      const domain = process.env.EMAIL_DOMAIN || 'snapmail.temp';
-      const sanitized = prefix.toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 20);
-      if (sanitized.length >= 3) {
-        const customEmail = `${sanitized}@${domain}`;
-        const existing = await Mailbox.findOne({ email: customEmail, is_active: true });
-        if (existing) {
-          return res.status(409).json({ error: 'This email prefix is already in use. Try another one.' });
+    const domain = process.env.EMAIL_DOMAIN || 'snapmail.temp';
+    const MAX_RETRIES = 3;
+    let attempts = 0;
+    let mailbox = null;
+    
+    while (attempts < MAX_RETRIES) {
+      attempts++;
+      
+      // Generate email address
+      let email;
+      if (prefix && attempts === 1) {
+        // First attempt: try custom prefix if provided
+        const sanitized = prefix.toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 20);
+        if (sanitized.length >= 3) {
+          email = `${sanitized}@${domain}`;
+          // Check if custom prefix is already taken
+          const existing = await Mailbox.findOne({ email, is_active: true });
+          if (existing) {
+            return res.status(409).json({ error: 'This email prefix is already in use. Try another one.' });
+          }
+        } else {
+          email = generateEmailAddress();
         }
+      } else {
+        // Retry or no prefix: generate random
+        email = generateEmailAddress();
+      }
+      
+      const expiresAt = new Date(Date.now() + selectedDuration * 60 * 1000);
+      
+      try {
+        mailbox = new Mailbox({ email, expires_at: expiresAt });
+        await mailbox.save();
+        break; // Success, exit loop
+      } catch (err) {
+        // If duplicate key error and we have retries left, try again with new address
+        if (err.code === 11000 && attempts < MAX_RETRIES) {
+          console.log(`Duplicate key collision, retrying (attempt ${attempts}/${MAX_RETRIES})`);
+          continue;
+        }
+        throw err; // Re-throw if not a collision or no retries left
       }
     }
     
-    const email = generateEmailAddress(prefix);
-    const expiresAt = new Date(Date.now() + selectedDuration * 60 * 1000);
-    
-    const mailbox = new Mailbox({
-      email,
-      expires_at: expiresAt
-    });
-    
-    await mailbox.save();
+    if (!mailbox) {
+      return res.status(500).json({ error: 'Failed to create mailbox after multiple attempts' });
+    }
     
     res.json({
       email: mailbox.email,
@@ -211,10 +279,16 @@ app.post('/api/mailbox/create', createMailboxLimiter, async (req, res) => {
 });
 
 
-// Get mailbox info
-app.get('/api/mailbox/:email', async (req, res) => {
+// Get mailbox info (with validation)
+app.get('/api/mailbox/:email',
+  [
+    param('email').isEmail().normalizeEmail().withMessage('Invalid email format')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
   try {
-    const mailbox = await Mailbox.findOne({ email: req.params.email, is_active: true });
+    const email = sanitizeEmail(req.params.email);
+    const mailbox = await Mailbox.findOne({ email, is_active: true });
     
     if (!mailbox) {
       return res.status(404).json({ error: 'Mailbox not found' });
@@ -231,10 +305,16 @@ app.get('/api/mailbox/:email', async (req, res) => {
   }
 });
 
-// Get emails for mailbox
-app.get('/api/mailbox/:email/emails', async (req, res) => {
+// Get emails for mailbox (with validation)
+app.get('/api/mailbox/:email/emails',
+  [
+    param('email').isEmail().normalizeEmail().withMessage('Invalid email format')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
   try {
-    const emails = await Email.find({ mailbox_email: req.params.email })
+    const email = sanitizeEmail(req.params.email);
+    const emails = await Email.find({ mailbox_email: email })
       .sort({ received_at: -1 })
       .limit(50);
     
@@ -253,10 +333,16 @@ app.get('/api/mailbox/:email/emails', async (req, res) => {
   }
 });
 
-// Refresh mailbox timer (extend by 10 minutes)
-app.post('/api/mailbox/:email/refresh', async (req, res) => {
+// Refresh mailbox timer (with validation)
+app.post('/api/mailbox/:email/refresh',
+  [
+    param('email').isEmail().normalizeEmail().withMessage('Invalid email format')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
   try {
-    const mailbox = await Mailbox.findOne({ email: req.params.email, is_active: true });
+    const email = sanitizeEmail(req.params.email);
+    const mailbox = await Mailbox.findOne({ email, is_active: true });
     
     if (!mailbox) {
       return res.status(404).json({ error: 'Mailbox not found' });
@@ -271,11 +357,17 @@ app.post('/api/mailbox/:email/refresh', async (req, res) => {
   }
 });
 
-// Delete mailbox
-app.delete('/api/mailbox/:email', async (req, res) => {
+// Delete mailbox (with validation)
+app.delete('/api/mailbox/:email',
+  [
+    param('email').isEmail().normalizeEmail().withMessage('Invalid email format')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
   try {
-    await Mailbox.deleteOne({ email: req.params.email });
-    await Email.deleteMany({ mailbox_email: req.params.email });
+    const email = sanitizeEmail(req.params.email);
+    await Mailbox.deleteOne({ email });
+    await Email.deleteMany({ mailbox_email: email });
     
     res.json({ success: true });
   } catch (error) {
@@ -283,17 +375,23 @@ app.delete('/api/mailbox/:email', async (req, res) => {
   }
 });
 
-// Generate test email (for testing purposes)
-app.post('/api/mailbox/:email/generate-email', async (req, res) => {
+// Generate test email (with validation)
+app.post('/api/mailbox/:email/generate-email',
+  [
+    param('email').isEmail().normalizeEmail().withMessage('Invalid email format')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
   try {
-    const mailbox = await Mailbox.findOne({ email: req.params.email, is_active: true });
+    const email = sanitizeEmail(req.params.email);
+    const mailbox = await Mailbox.findOne({ email, is_active: true });
     
     if (!mailbox) {
       return res.status(404).json({ error: 'Mailbox not found' });
     }
     
     const testEmail = new Email({
-      mailbox_email: req.params.email,
+      mailbox_email: email,
       sender: 'test@example.com',
       subject: 'Test Email - ' + new Date().toLocaleTimeString(),
       body: 'This is a test email generated at ' + new Date().toLocaleString() + '\n\nYour SnapMail inbox is working correctly!',
@@ -308,8 +406,13 @@ app.post('/api/mailbox/:email/generate-email', async (req, res) => {
   }
 });
 
-// Get single email by ID
-app.get('/api/email/:id', async (req, res) => {
+// Get single email by ID (with validation)
+app.get('/api/email/:id',
+  [
+    param('id').custom((value) => isValidObjectId(value)).withMessage('Invalid email ID format')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
   try {
     const email = await Email.findById(req.params.id);
     
@@ -337,14 +440,20 @@ app.get('/api/email/:id', async (req, res) => {
 
 // ============== TESTMAIL WEBHOOK ==============
 // This endpoint receives incoming emails from Testmail.app
+// NOTE: No rate limiting on webhooks - email services need unrestricted access
 app.post('/api/webhook/testmail', async (req, res) => {
   try {
     console.log('📧 Received webhook from Testmail:', JSON.stringify(req.body, null, 2));
     
     const { to, from, subject, text, html } = req.body;
     
-    // Extract the email address from 'to' field
-    const toEmail = Array.isArray(to) ? to[0] : to;
+    // Extract and sanitize the email address from 'to' field
+    const rawToEmail = Array.isArray(to) ? to[0] : to;
+    const toEmail = sanitizeEmail(rawToEmail);
+    
+    if (!toEmail || !isValidEmailFormat(toEmail)) {
+      return res.status(400).json({ error: 'Invalid recipient email' });
+    }
     
     // Check if mailbox exists
     const mailbox = await Mailbox.findOne({ email: toEmail, is_active: true });
@@ -354,13 +463,13 @@ app.post('/api/webhook/testmail', async (req, res) => {
       return res.status(200).json({ received: true, stored: false });
     }
     
-    // Store the email
+    // Store the email with sanitized and size-limited inputs
     const email = new Email({
       mailbox_email: toEmail,
-      sender: from || 'unknown@sender.com',
-      subject: subject || '(No Subject)',
-      body: text || '',
-      body_html: html || ''
+      sender: sanitizeEmail(from) || 'unknown@sender.com',
+      subject: sanitizeString(subject, MAX_SUBJECT_LENGTH) || '(No Subject)',
+      body: sanitizeString(text, MAX_BODY_LENGTH) || '',
+      body_html: sanitizeHtml(html, MAX_BODY_LENGTH) || ''
     });
     
     await email.save();
@@ -375,6 +484,7 @@ app.post('/api/webhook/testmail', async (req, res) => {
 
 // ============== CLOUDFLARE EMAIL WEBHOOK ==============
 // This endpoint receives incoming emails from Cloudflare Email Workers
+// NOTE: No rate limiting on webhooks - email services need unrestricted access
 app.post('/api/webhook/email', async (req, res) => {
   try {
     console.log('📧 Received email from Cloudflare:', JSON.stringify(req.body, null, 2));
@@ -385,7 +495,7 @@ app.post('/api/webhook/email', async (req, res) => {
     const rawToEmail = Array.isArray(to) ? to[0] : to;
     const toEmail = sanitizeEmail(rawToEmail);
     
-    if (!toEmail) {
+    if (!toEmail || !isValidEmailFormat(toEmail)) {
       return res.status(400).json({ error: 'Invalid recipient email' });
     }
     
@@ -397,13 +507,13 @@ app.post('/api/webhook/email', async (req, res) => {
       return res.status(200).json({ received: true, stored: false });
     }
     
-    // Store the email with sanitized inputs
+    // Store the email with sanitized and size-limited inputs
     const email = new Email({
       mailbox_email: toEmail,
       sender: sanitizeEmail(from) || 'unknown@sender.com',
-      subject: sanitizeString(subject) || '(No Subject)',
-      body: sanitizeString(text) || '',
-      body_html: sanitizeString(html) || ''
+      subject: sanitizeString(subject, MAX_SUBJECT_LENGTH) || '(No Subject)',
+      body: sanitizeString(text, MAX_BODY_LENGTH) || '',
+      body_html: sanitizeHtml(html, MAX_BODY_LENGTH) || ''
     });
     
     await email.save();
